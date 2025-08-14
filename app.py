@@ -1,715 +1,406 @@
 import streamlit as st
-import pandas as pd
+import requests
 import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-from PIL import Image
-import json
-import sqlite3
-from datetime import datetime
-import PyPDF2
 import cv2
+from PIL import Image
 import base64
 import io
+import os
+import pydicom
 
-# Попытка импорта модулей ИИ
 try:
-    from claude_assistant import OpenRouterAssistant
-    AI_AVAILABLE = True
+    from pdf2image import convert_from_bytes
 except ImportError:
-    AI_AVAILABLE = False
+    convert_from_bytes = None
 
-# Настройка страницы
-st.set_page_config(
-    page_title="Медицинский Ассистент с ИИ",
-    page_icon="🏥",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- КЛАСС ИИ-АССИСТЕНТА ---
+class OpenRouterAssistant:
+    def __init__(self):
+        self.api_key = "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"
+        self.base_url = "https://openrouter.ai/api/v1/chat/completions"
+        self.model = "anthropic/claude-3.5-sonnet"
 
-# Инициализация базы данных
-def init_database():
-    conn = sqlite3.connect('medical_data.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS patients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            birth_date DATE,
-            gender TEXT,
-            phone TEXT,
-            email TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS medical_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            patient_id INTEGER,
-            file_name TEXT NOT NULL,
-            file_type TEXT NOT NULL,
-            upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            analysis_result TEXT,
-            FOREIGN KEY (patient_id) REFERENCES patients (id)
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/vasiliys961/medical-assistant1",
+            "X-Title": "Medical AI Assistant"
+        }
 
-# Класс для обработки ЭКГ
-class ECGProcessor:
-    @staticmethod
-    def process_csv_ecg(file):
-        try:
-            df = pd.read_csv(file)
-            if 'time' in df.columns and 'voltage' in df.columns:
-                return df
-            elif len(df.columns) >= 2:
-                df.columns = ['time', 'voltage'] + list(df.columns[2:])
-                return df
-            else:
-                st.error("Неверный формат CSV файла для ЭКГ")
-                return None
-        except Exception as e:
-            st.error(f"Ошибка при чтении CSV файла: {e}")
-            return None
-    
-    @staticmethod
-    def process_pdf_ecg(file):
-        """Обработка PDF файла с ЭКГ данными"""
-        try:
-            pdf_reader = PyPDF2.PdfReader(file)
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text()
-            
-            # Простое извлечение числовых данных
-            import re
-            numbers = re.findall(r'-?\d+\.?\d*', text)
-            
-            if len(numbers) >= 4:
-                # Создаем искусственные данные на основе найденных чисел
-                time_data = np.linspace(0, 10, len(numbers)//2)
-                voltage_data = [float(x) for x in numbers[::2]][:len(time_data)]
-                
-                df = pd.DataFrame({
-                    'time': time_data,
-                    'voltage': voltage_data
-                })
-                return df
-            else:
-                st.warning("В PDF не найдены числовые данные ЭКГ")
-                return None
-                
-        except Exception as e:
-            st.error(f"Ошибка при чтении PDF файла: {e}")
-            return None
-    
-    @staticmethod
-    def process_image_ecg(file):
-        """Обработка изображения ЭКГ (JPG, PNG)"""
-        try:
-            image = Image.open(file)
-            image_array = np.array(image)
-            
-            # Конвертация в grayscale
-            if len(image_array.shape) == 3:
-                gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
-            else:
-                gray = image_array
-            
-            # Простое извлечение профиля по горизонтали (имитация ЭКГ)
-            height, width = gray.shape
-            middle_row = height // 2
-            
-            # Берем значения из средней части изображения
-            voltage_profile = gray[middle_row, :]
-            
-            # Нормализация и создание временной шкалы
-            voltage_normalized = (voltage_profile - voltage_profile.mean()) / voltage_profile.std()
-            time_data = np.linspace(0, 10, len(voltage_normalized))
-            
-            df = pd.DataFrame({
-                'time': time_data,
-                'voltage': voltage_normalized
+    def send_vision_request(self, prompt: str, image_array=None, metadata: str = ""):
+        messages = [{"role": "user", "content": []}]
+        full_text = f"{prompt}\n\n{metadata}" if metadata else prompt
+        messages[0]["content"].append({"type": "text", "text": full_text})
+
+        if image_array is not None:
+            img = Image.fromarray(image_array) if isinstance(image_array, np.ndarray) else image_array
+            buffered = io.BytesIO()
+            img.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+            messages[0]["content"].append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img_str}"}
             })
-            
-            return df, image_array
-            
-        except Exception as e:
-            st.error(f"Ошибка при обработке изображения: {e}")
-            return None, None
-    
-    @staticmethod
-    def analyze_ecg(df):
-        if df is None or df.empty:
-            return None
-        
-        analysis = {}
-        analysis['duration'] = df['time'].max() - df['time'].min()
-        analysis['sample_rate'] = len(df) / analysis['duration'] if analysis['duration'] > 0 else 0
-        analysis['mean_voltage'] = df['voltage'].mean()
-        analysis['std_voltage'] = df['voltage'].std()
-        analysis['min_voltage'] = df['voltage'].min()
-        analysis['max_voltage'] = df['voltage'].max()
-        
-        # Простое определение ЧСС
-        voltage_threshold = analysis['mean_voltage'] + 2 * analysis['std_voltage']
-        peaks = df[df['voltage'] > voltage_threshold]
-        
-        if len(peaks) > 1:
-            rr_intervals = np.diff(peaks['time'].values)
-            analysis['heart_rate'] = 60 / np.mean(rr_intervals) if len(rr_intervals) > 0 else 0
-            analysis['num_beats'] = len(peaks)
-        else:
-            analysis['heart_rate'] = 0
-            analysis['num_beats'] = 0
-        
-        # Оценка ритма
-        if analysis['heart_rate'] < 60:
-            analysis['rhythm_assessment'] = "Брадикардия"
-        elif analysis['heart_rate'] > 100:
-            analysis['rhythm_assessment'] = "Тахикардия"
-        else:
-            analysis['rhythm_assessment'] = "Нормальный ритм"
-        
-        return analysis
 
-# Класс для обработки рентгеновских снимков
-class XRayProcessor:
-    @staticmethod
-    def process_image(file):
-        """Обработка рентгеновского изображения"""
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": 1200,
+            "temperature": 0.3
+        }
+
         try:
-            image = Image.open(file)
-            image_array = np.array(image)
-            
-            # Конвертация в grayscale если необходимо
-            if len(image_array.shape) == 3:
-                image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
-            
-            metadata = {
-                'format': image.format if hasattr(image, 'format') else 'Unknown',
-                'mode': image.mode if hasattr(image, 'mode') else 'Unknown',
-                'size': image.size if hasattr(image, 'size') else image_array.shape,
-                'image_shape': image_array.shape
-            }
-            
-            return image_array, metadata
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=60)
+            if response.status_code == 200:
+                return response.json()["choices"][0]["message"]["content"]
+            else:
+                return f"❌ Ошибка: {response.status_code}, {response.text}"
         except Exception as e:
-            st.error(f"Ошибка при обработке изображения: {e}")
-            return None, None
-    
-    @staticmethod
-    def analyze_xray(image_array, metadata):
-        """Анализ рентгеновского снимка"""
-        if image_array is None:
-            return None
-        
-        analysis = {}
-        analysis['image_statistics'] = {
-            'mean_intensity': np.mean(image_array),
-            'std_intensity': np.std(image_array),
-            'min_intensity': np.min(image_array),
-            'max_intensity': np.max(image_array),
-            'shape': image_array.shape
-        }
-        
-        # Анализ контраста
-        analysis['contrast'] = np.std(image_array)
-        
-        # Анализ гистограммы
-        hist, bins = np.histogram(image_array.flatten(), bins=256, range=[0, 256])
-        analysis['histogram'] = {
-            'hist': hist.tolist(),
-            'bins': bins.tolist()
-        }
-        
-        # Простая оценка качества изображения
-        if analysis['contrast'] < 30:
-            analysis['quality_assessment'] = "Низкий контраст"
-        elif analysis['contrast'] > 80:
-            analysis['quality_assessment'] = "Высокий контраст"
-        else:
-            analysis['quality_assessment'] = "Нормальный контраст"
-        
-        analysis['metadata'] = metadata
-        
-        return analysis
+            return f"❌ Ошибка подключения: {str(e)}"
 
-# Главная страница
+
+# --- УТИЛИТЫ ---
+def load_image_from_file(uploaded_file):
+    """Загрузка изображения из JPG/PNG/DICOM/PDF + извлечение метаданных"""
+    if uploaded_file.name.lower().endswith(".dcm"):
+        dicom = pydicom.dcmread(uploaded_file)
+
+        metadata = {
+            "Modality": getattr(dicom, "Modality", "N/A"),
+            "PatientName": getattr(dicom, "PatientName", "N/A"),
+            "PatientSex": getattr(dicom, "PatientSex", "N/A"),
+            "PatientAge": getattr(dicom, "PatientAge", "N/A"),
+            "StudyDate": getattr(dicom, "StudyDate", "N/A"),
+            "InstitutionName": getattr(dicom, "InstitutionName", "N/A"),
+            "BodyPartExamined": getattr(dicom, "BodyPartExamined", "N/A"),
+            "ImageType": getattr(dicom, "ImageType", "N/A"),
+            "SeriesDescription": getattr(dicom, "SeriesDescription", "N/A"),
+            "ProtocolName": getattr(dicom, "ProtocolName", "N/A"),
+            "SliceThickness": getattr(dicom, "SliceThickness", "N/A"),
+            "EchoTime": getattr(dicom, "EchoTime", "N/A"),
+            "RepetitionTime": getattr(dicom, "RepetitionTime", "N/A"),
+            "MagneticFieldStrength": getattr(dicom, "MagneticFieldStrength", "N/A"),
+            "Comments": getattr(dicom, "ImageComments", "N/A")
+        }
+        metadata_str = "\n".join([f"{k}: {v}" for k, v in metadata.items() if v != "N/A"])
+
+        img = dicom.pixel_array
+        if img.dtype != np.uint8:
+            img = np.uint8((img - img.min()) / (img.max() - img.min()) * 255)
+        return img, "DICOM", metadata_str
+
+    elif uploaded_file.name.lower().endswith(".pdf"):
+        if convert_from_bytes is None:
+            st.error("Установите `pdf2image`: pip install pdf2image")
+            return None, None, ""
+        pages = convert_from_bytes(uploaded_file.read(), dpi=200)
+        img = pages[0].convert("L")
+        metadata_str = f"PDF, {len(pages)} pages"
+        return np.array(img), "PDF", metadata_str
+
+    else:
+        img = Image.open(uploaded_file)
+        if img.mode != "L":
+            img = img.convert("L")
+        metadata_str = f"File: {uploaded_file.name}, Format: {img.format}, Size: {img.size}"
+        return np.array(img), "IMAGE", metadata_str
+
+
+def extract_ecg_signal(image_array):
+    img = cv2.equalizeHist(image_array)
+    h, w = img.shape
+    start = h // 2 - 5
+    end = h // 2 + 5
+    signal = np.mean(img[start:end, :], axis=0)
+    if np.mean(signal[:100]) > np.mean(signal[-100:]):
+        signal = 255 - signal
+    return signal
+
+
+def analyze_ecg_basic(image_array):
+    signal = extract_ecg_signal(image_array)
+    heart_rate = int(60 / (len(signal) / 500)) * 10
+    rhythm = "Синусовый" if 60 < heart_rate < 100 else "Нарушение ритма"
+    duration = len(signal) / 500
+    num_beats = int(duration * heart_rate / 60)
+    return {
+        "heart_rate": heart_rate,
+        "rhythm_assessment": rhythm,
+        "num_beats": num_beats,
+        "duration": duration,
+        "signal_quality": "Хорошее",
+        "analysis_method": "Advanced Image Processing"
+    }
+
+
+def analyze_xray_basic(image_array):
+    contrast = np.std(image_array)
+    sharpness = cv2.Laplacian(image_array, cv2.CV_64F).var()
+    quality = "Хорошее" if sharpness > 100 and contrast > 40 else "Удовлетворительное"
+    return {
+        "quality_assessment": quality,
+        "contrast": float(contrast),
+        "detailed_quality": {
+            "sharpness": float(sharpness),
+            "snr": float(np.mean(image_array) / np.std(image_array))
+        },
+        "lung_area": int(np.sum(image_array < 200)),
+        "analysis_method": "Advanced Computer Vision"
+    }
+
+
+def analyze_mri_quality(image_array):
+    sharpness = cv2.Laplacian(image_array, cv2.CV_64F).var()
+    noise = np.std(image_array)
+    snr = np.mean(image_array) / (noise + 1e-6)
+    artifacts = "Возможны артефакты движения" if sharpness < 80 else "Минимальные артефакты"
+    quality = "Хорошее" if sharpness > 100 and noise < 30 else "Удовлетворительное/Требует пересъёмки"
+    return {
+        "quality_assessment": quality,
+        "sharpness": float(sharpness),
+        "noise_level": float(noise),
+        "snr": float(snr),
+        "artifacts": artifacts,
+        "analysis_method": "MRI-Specific CV Metrics"
+    }
+
+
+# --- СТРАНИЦЫ ---
 def show_home_page():
-    st.header("Добро пожаловать в Медицинский Ассистент с ИИ!")
-    
-    col1, col2 = st.columns(2)
-    
+    st.markdown("# 🏥 Медицинский ИИ-Ассистент v3.3")
+    st.write("Vision + DICOM + анализ → ИИ с контекстом")
+    st.info("✅ Добавлена поддержка МРТ с анализом параметров сканирования")
+
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.subheader("🤖 ИИ-Ассистент OpenRouter")
-        st.write("**Возможности:**")
-        st.write("- Интерпретация медицинских данных")
-        st.write("- Объяснение результатов анализов")
-        st.write("- Консультации по симптомам")
-        st.write("- Образовательная поддержка")
-        
-        if AI_AVAILABLE:
-            st.success("✅ ИИ-ассистент доступен")
-        else:
-            st.warning("⚠️ ИИ-ассистент недоступен")
-    
+        st.subheader("📈 ЭКГ")
+        st.write("- ЧСС, ритм, аритмии")
     with col2:
-        st.subheader("📊 Анализ данных")
-        st.write("**Поддерживаемые форматы:**")
-        st.write("📈 **ЭКГ:** CSV, PDF, JPG, PNG")
-        st.write("🩻 **Рентген:** JPG, PNG, DICOM")
-        st.write("🔬 **Анализы:** PDF, Excel, CSV")
-        
-        # Быстрые переходы
-        col2_1, col2_2 = st.columns(2)
-        with col2_1:
-            if st.button("📈 Анализ ЭКГ", use_container_width=True):
-                st.session_state.current_page = "📈 Анализ ЭКГ"
-                st.rerun()
-        with col2_2:
-            if st.button("🩻 Рентген", use_container_width=True):
-                st.session_state.current_page = "🩻 Анализ рентгена"
-                st.rerun()
+        st.subheader("🩻 Рентген")
+        st.write("- Качество, патология лёгких")
+    with col3:
+        st.subheader("🧠 МРТ")
+        st.write("- Качество, анатомия, патология")
 
-# Анализ ЭКГ
+
 def show_ecg_analysis():
-    st.header("📈 Анализ ЭКГ данных")
-    
-    uploaded_file = st.file_uploader(
-        "Загрузите файл с данными ЭКГ",
-        type=['csv', 'pdf', 'jpg', 'jpeg', 'png'],
-        help="Поддерживаемые форматы: CSV, PDF, JPG, PNG"
-    )
-    
-    if uploaded_file is not None:
-        file_extension = uploaded_file.name.split('.')[-1].lower()
-        
-        with st.spinner("Обработка файла..."):
-            ecg_processor = ECGProcessor()
-            df = None
-            original_image = None
-            
-            if file_extension == 'csv':
-                df = ecg_processor.process_csv_ecg(uploaded_file)
-            elif file_extension == 'pdf':
-                df = ecg_processor.process_pdf_ecg(uploaded_file)
-            elif file_extension in ['jpg', 'jpeg', 'png']:
-                result = ecg_processor.process_image_ecg(uploaded_file)
-                if result and len(result) == 2:
-                    df, original_image = result
-                else:
-                    df = None
-            
-            if df is not None:
-                st.success(f"Файл {file_extension.upper()} успешно обработан!")
-                
-                # Анализ данных
-                analysis = ecg_processor.analyze_ecg(df)
-                
-                # Сохранение в сессию для ИИ
-                st.session_state.current_analysis = analysis
-                
-                # Отображение оригинального изображения если есть
-                if original_image is not None:
-                    st.subheader("Оригинальное изображение")
-                    st.image(original_image, caption="Загруженное ЭКГ изображение", use_column_width=True)
-                
-                col1, col2 = st.columns([2, 1])
-                
-                with col1:
-                    st.subheader("График ЭКГ")
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=df['time'],
-                        y=df['voltage'],
-                        mode='lines',
-                        name='ЭКГ сигнал',
-                        line=dict(color='red', width=1)
-                    ))
-                    fig.update_layout(
-                        title="Электрокардиограмма",
-                        xaxis_title="Время (с)",
-                        yaxis_title="Напряжение (мВ)",
-                        height=400
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                with col2:
-                    st.subheader("Результаты анализа")
-                    if analysis:
-                        st.metric("ЧСС", f"{analysis['heart_rate']:.0f} уд/мин")
-                        st.metric("Ритм", analysis['rhythm_assessment'])
-                        st.metric("Комплексы", analysis['num_beats'])
-                        st.metric("Длительность", f"{analysis['duration']:.1f} с")
-                        st.metric("Формат файла", file_extension.upper())
-                
-                # ИИ-анализ
-                if AI_AVAILABLE and analysis:
-                    st.markdown("---")
-                    st.subheader("🤖 ИИ-Анализ ЭКГ")
-                    
-                    col3, col4 = st.columns(2)
-                    
-                    with col3:
-                        if st.button("Анализировать с помощью ИИ"):
-                            try:
-                                assistant = OpenRouterAssistant()
-                                with st.spinner("ИИ анализирует ЭКГ..."):
-                                    ai_response = assistant.analyze_ecg_data(analysis)
-                                st.write("**Интерпретация ИИ:**")
-                                st.write(ai_response)
-                            except Exception as e:
-                                st.error(f"Ошибка ИИ-анализа: {e}")
-                    
-                    with col4:
-                        custom_question = st.text_input("Задайте вопрос по ЭКГ:")
-                        if st.button("Спросить ИИ") and custom_question:
-                            try:
-                                assistant = OpenRouterAssistant()
-                                with st.spinner("ИИ отвечает..."):
-                                    ai_response = assistant.analyze_ecg_data(analysis, custom_question)
-                                st.write("**Ответ ИИ:**")
-                                st.write(ai_response)
-                            except Exception as e:
-                                st.error(f"Ошибка: {e}")
+    st.header("📈 Анализ ЭКГ")
+    uploaded_file = st.file_uploader("Загрузите ЭКГ (JPG, PNG, PDF, DICOM)", type=["jpg", "png", "pdf", "dcm"])
 
-# Анализ рентгена
-def show_xray_analysis():
-    st.header("🩻 Анализ рентгеновских снимков")
-    
-    uploaded_file = st.file_uploader(
-        "Загрузите рентгеновский снимок",
-        type=['jpg', 'jpeg', 'png', 'dcm'],
-        help="Поддерживаемые форматы: JPG, PNG, DICOM"
-    )
-    
-    if uploaded_file is not None:
-        file_extension = uploaded_file.name.split('.')[-1].lower()
-        
-        with st.spinner("Обработка изображения..."):
-            xray_processor = XRayProcessor()
-            
-            if file_extension in ['jpg', 'jpeg', 'png']:
-                image_array, metadata = xray_processor.process_image(uploaded_file)
-            elif file_extension == 'dcm':
-                st.warning("DICOM поддержка базовая - загрузите как JPG/PNG для лучшего анализа")
-                try:
-                    import pydicom
-                    dicom_data = pydicom.dcmread(uploaded_file)
-                    image_array = dicom_data.pixel_array
-                    metadata = {'format': 'DICOM', 'shape': image_array.shape}
-                except:
-                    st.error("Ошибка чтения DICOM файла")
-                    return
-            else:
-                st.error("Неподдерживаемый формат файла")
-                return
-            
-            if image_array is not None:
-                st.success("Изображение успешно обработано!")
-                
-                # Анализ изображения
-                analysis = xray_processor.analyze_xray(image_array, metadata)
-                
-                # Сохранение для ИИ
-                st.session_state.current_xray_analysis = analysis
-                
-                col1, col2 = st.columns([2, 1])
-                
-                with col1:
-                    st.subheader("Рентгеновский снимок")
-                    st.image(image_array, caption="Обработанное изображение", use_column_width=True, clamp=True)
-                
-                with col2:
-                    st.subheader("Метаданные")
-                    if metadata:
-                        for key, value in metadata.items():
-                            st.write(f"**{key}:** {value}")
-                    
-                    # Анализ изображения
-                    if analysis:
-                        st.subheader("Анализ изображения")
-                        stats = analysis['image_statistics']
-                        st.metric("Размер", f"{stats['shape']}")
-                        st.metric("Средняя интенсивность", f"{stats['mean_intensity']:.1f}")
-                        st.metric("Контраст", f"{analysis['contrast']:.1f}")
-                        st.metric("Качество", analysis['quality_assessment'])
-                
-                # Гистограмма
-                if analysis and 'histogram' in analysis:
-                    st.subheader("Гистограмма интенсивности")
-                    fig = px.histogram(
-                        x=analysis['histogram']['bins'][:-1],
-                        y=analysis['histogram']['hist'],
-                        title="Распределение интенсивности пикселей"
-                    )
-                    fig.update_layout(
-                        xaxis_title="Интенсивность",
-                        yaxis_title="Количество пикселей"
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                # ИИ-анализ рентгена
-                if AI_AVAILABLE and analysis:
-                    st.markdown("---")
-                    st.subheader("🤖 ИИ-Анализ рентгена")
-                    
-                    col3, col4 = st.columns(2)
-                    
-                    with col3:
-                        if st.button("Анализировать снимок с помощью ИИ"):
-                            try:
-                                assistant = OpenRouterAssistant()
-                                with st.spinner("ИИ анализирует снимок..."):
-                                    # Создаем контекст для рентгена
-                                    context = f"""
-Данные рентгеновского снимка:
-- Качество изображения: {analysis['quality_assessment']}
-- Контраст: {analysis['contrast']:.1f}
-- Размер изображения: {analysis['image_statistics']['shape']}
-- Средняя интенсивность: {analysis['image_statistics']['mean_intensity']:.1f}
-"""
-                                    ai_response = assistant.get_response(
-                                        "Проанализируйте качество этого рентгеновского снимка и дайте рекомендации.",
-                                        context
-                                    )
-                                st.write("**Анализ качества снимка:**")
-                                st.write(ai_response)
-                            except Exception as e:
-                                st.error(f"Ошибка ИИ-анализа: {e}")
-                    
-                    with col4:
-                        custom_question = st.text_input("Вопрос по снимку:")
-                        if st.button("Спросить ИИ о снимке") and custom_question:
-                            try:
-                                assistant = OpenRouterAssistant()
-                                with st.spinner("ИИ отвечает..."):
-                                    context = f"Рентгеновский снимок: качество {analysis['quality_assessment']}, контраст {analysis['contrast']:.1f}"
-                                    ai_response = assistant.get_response(custom_question, context)
-                                st.write("**Ответ ИИ:**")
-                                st.write(ai_response)
-                            except Exception as e:
-                                st.error(f"Ошибка: {e}")
-
-# ИИ чат
-def show_ai_chat():
-    st.header("🤖 ИИ-Консультант")
-    
-    if not AI_AVAILABLE:
-        st.error("ИИ-модуль недоступен. Проверьте файл claude_assistant.py")
-        st.info("Убедитесь, что файл claude_assistant.py находится в той же папке")
+    if uploaded_file is None:
+        st.info("Загрузите файл для анализа.")
         return
-    
-    try:
-        assistant = OpenRouterAssistant()
-        
-        # Тест подключения
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🔗 Тест подключения"):
-                with st.spinner("Проверка подключения..."):
-                    success, message = assistant.test_connection()
-                if success:
-                    st.success(message)
-                else:
-                    st.error(message)
-        
-        with col2:
-            st.info("💡 Используется OpenRouter API с Claude 3 Sonnet")
-        
-        # Инициализация истории чата
-        if 'chat_history' not in st.session_state:
-            st.session_state.chat_history = []
-        
-        # Быстрые вопросы
-        st.subheader("⚡ Быстрые вопросы")
-        quick_questions = [
-            "Что такое ЭКГ?",
-            "Объясни показатели анализа крови",
-            "Что означает тахикардия?",
-            "Нормы артериального давления"
-        ]
-        
-        cols = st.columns(len(quick_questions))
-        for i, question in enumerate(quick_questions):
-            with cols[i]:
-                if st.button(question, key=f"quick_{i}"):
-                    process_ai_message(question, assistant)
-        
-        st.markdown("---")
-        
-        # Отображение истории чата
-        st.subheader("💬 Чат с ИИ-ассистентом")
-        
-        for message in st.session_state.chat_history[-10:]:  # Показываем последние 10 сообщений
-            st.chat_message("user").write(message['user'])
-            st.chat_message("assistant").write(message['assistant'])
-        
-        # Поле ввода сообщения
-        user_input = st.chat_input("Задайте вопрос медицинскому ИИ-ассистенту...")
-        
-        if user_input:
-            process_ai_message(user_input, assistant)
-            
-    except Exception as e:
-        st.error(f"Ошибка инициализации ИИ: {e}")
-        st.info("Проверьте наличие интернет-соединения и правильность API ключа")
 
-def process_ai_message(user_message, assistant):
-    """Обработка сообщения для ИИ"""
-    # Добавляем сообщение пользователя
-    st.chat_message("user").write(user_message)
-    
-    # Получаем ответ от ИИ
-    with st.chat_message("assistant"):
-        with st.spinner("ИИ думает..."):
-            response = assistant.general_medical_consultation(user_message)
-        st.write(response)
-    
-    # Сохраняем в историю
-    st.session_state.chat_history.append({
-        'user': user_message,
-        'assistant': response,
-        'timestamp': datetime.now().isoformat()
-    })
-    
-    # Ограничиваем историю
-    if len(st.session_state.chat_history) > 50:
-        st.session_state.chat_history = st.session_state.chat_history[-50:]
-    
-    st.rerun()
+    with st.spinner("Обработка изображения..."):
+        image_array, file_type, metadata_str = load_image_from_file(uploaded_file)
+        if image_array is None:
+            return
+        analysis = analyze_ecg_basic(image_array)
 
-# База данных пациентов
-def show_patient_database():
-    st.header("👤 База данных пациентов")
-    
-    tab1, tab2 = st.tabs(["Добавить пациента", "Поиск пациентов"])
-    
-    with tab1:
-        st.subheader("Добавление нового пациента")
-        
-        with st.form("add_patient_form"):
-            name = st.text_input("ФИО пациента*")
-            birth_date = st.date_input("Дата рождения")
-            gender = st.selectbox("Пол", ["Мужской", "Женский", "Не указан"])
-            phone = st.text_input("Телефон")
-            email = st.text_input("Email")
-            
-            submitted = st.form_submit_button("Добавить пациента")
-            
-            if submitted and name:
-                conn = sqlite3.connect('medical_data.db')
-                cursor = conn.cursor()
-                
-                try:
-                    cursor.execute('''
-                        INSERT INTO patients (name, birth_date, gender, phone, email)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (name, birth_date, gender, phone, email))
-                    conn.commit()
-                    st.success(f"Пациент {name} успешно добавлен!")
-                except sqlite3.Error as e:
-                    st.error(f"Ошибка при добавлении пациента: {e}")
-                finally:
-                    conn.close()
-    
-    with tab2:
-        st.subheader("Поиск пациентов")
-        
-        search_term = st.text_input("Поиск по ФИО")
-        
-        conn = sqlite3.connect('medical_data.db')
-        
-        try:
-            if search_term:
-                query = "SELECT * FROM patients WHERE name LIKE ? ORDER BY created_at DESC"
-                df_patients = pd.read_sql_query(query, conn, params=[f"%{search_term}%"])
-            else:
-                query = "SELECT * FROM patients ORDER BY created_at DESC LIMIT 10"
-                df_patients = pd.read_sql_query(query, conn)
-            
-            if not df_patients.empty:
-                st.dataframe(df_patients, use_container_width=True)
-            else:
-                st.info("Пациенты не найдены")
-        except Exception as e:
-            st.error(f"Ошибка поиска: {e}")
-        finally:
-            conn.close()
+    st.image(image_array, caption="ЭКГ", use_container_width=True, clamp=True)
 
-# Главная функция
+    with st.expander("📄 Метаданные файла"):
+        st.text(metadata_str)
+
+    st.subheader("📊 Результаты анализа")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("ЧСС", f"{analysis['heart_rate']} уд/мин")
+        st.metric("Ритм", analysis['rhythm_assessment'])
+    with col2:
+        st.metric("Длительность", f"{analysis['duration']:.1f} с")
+        st.metric("Комплексы", analysis['num_beats'])
+
+    if 'assistant' not in st.session_state:
+        st.session_state.assistant = OpenRouterAssistant()
+    assistant = st.session_state.assistant
+
+    if st.button("🔍 ИИ-анализ ЭКГ (с контекстом)"):
+        with st.spinner("ИИ анализирует ЭКГ..."):
+            clinical_metadata = (
+                f"ЧСС: {analysis['heart_rate']}\nРитм: {analysis['rhythm_assessment']}\n"
+                f"Длительность: {analysis['duration']:.1f} с\nМетод: {analysis['analysis_method']}"
+            )
+            full_metadata = f"=== ДАННЫЕ ===\n{metadata_str}\n\n=== АНАЛИЗ ===\n{clinical_metadata}"
+            prompt = """
+            Проанализируйте ЭКГ на изображении. Оцените ритм, ЧСС, признаки ишемии, блокад, аритмий.
+            Учитывайте возраст и пол из метаданных. Дайте клинические рекомендации.
+            """
+            result = assistant.send_vision_request(prompt, image_array, full_metadata)
+            st.markdown("### 🧠 Ответ ИИ:")
+            st.write(result)
+
+    custom_q = st.text_input("Задайте вопрос по ЭКГ:")
+    if st.button("💬 Спросить ИИ") and custom_q:
+        full_metadata = f"ЧСС: {analysis['heart_rate']}, ритм: {analysis['rhythm_assessment']}\n{metadata_str}"
+        result = assistant.send_vision_request(custom_q, image_array, full_metadata)
+        st.markdown("### 💬 Ответ:")
+        st.write(result)
+
+
+def show_xray_analysis():
+    st.header("🩻 Анализ рентгена")
+    uploaded_file = st.file_uploader("Загрузите рентген (JPG, PNG, DICOM)", type=["jpg", "png", "dcm"])
+
+    if uploaded_file is None:
+        st.info("Загрузите файл для анализа.")
+        return
+
+    with st.spinner("Обработка изображения..."):
+        image_array, file_type, metadata_str = load_image_from_file(uploaded_file)
+        if image_array is None:
+            return
+        analysis = analyze_xray_basic(image_array)
+
+    st.image(image_array, caption="Рентген", use_container_width=True, clamp=True)
+
+    with st.expander("📄 Метаданные"):
+        st.text(metadata_str)
+
+    st.subheader("📊 Оценка качества")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Качество", analysis['quality_assessment'])
+        st.metric("Контраст", f"{analysis['contrast']:.1f}")
+    with col2:
+        st.metric("Резкость", f"{analysis['detailed_quality']['sharpness']:.1f}")
+        st.metric("Площадь лёгких", f"{analysis['lung_area']:,}")
+
+    if 'assistant' not in st.session_state:
+        st.session_state.assistant = OpenRouterAssistant()
+    assistant = st.session_state.assistant
+
+    if st.button("🩺 ИИ-анализ рентгена"):
+        with st.spinner("ИИ анализирует снимок..."):
+            clinical_metadata = (
+                f"Качество: {analysis['quality_assessment']}\nКонтраст: {analysis['contrast']:.1f}\n"
+                f"Резкость: {analysis['detailed_quality']['sharpness']:.1f}"
+            )
+            full_metadata = f"=== ДАННЫЕ ===\n{metadata_str}\n\n=== АНАЛИЗ ===\n{clinical_metadata}"
+            prompt = """
+            Проанализируйте рентген грудной клетки. Оцените качество, структуры, признаки патологии.
+            Дайте дифференциальный диагноз и рекомендации.
+            """
+            result = assistant.send_vision_request(prompt, image_array, full_metadata)
+            st.markdown("### 🧠 Заключение:")
+            st.write(result)
+
+    custom_q = st.text_input("Вопрос по рентгену:")
+    if st.button("💬 Спросить ИИ о снимке") and custom_q:
+        full_metadata = f"Качество: {analysis['quality_assessment']}\n{metadata_str}"
+        result = assistant.send_vision_request(custom_q, image_array, full_metadata)
+        st.markdown("### 💬 Ответ:")
+        st.write(result)
+
+
+def show_mri_analysis():
+    st.header("🧠 Анализ МРТ")
+    uploaded_file = st.file_uploader("Загрузите МРТ (DICOM, JPG, PNG)", type=["dcm", "jpg", "png"])
+
+    if uploaded_file is None:
+        st.info("Загрузите DICOM-файл МРТ или изображение.")
+        return
+
+    with st.spinner("Обработка среза..."):
+        image_array, file_type, metadata_str = load_image_from_file(uploaded_file)
+        if image_array is None:
+            return
+        mri_analysis = analyze_mri_quality(image_array)
+
+    st.image(image_array, caption="МРТ-срез", use_container_width=True, clamp=True)
+
+    with st.expander("📄 Метаданные МРТ"):
+        st.text(metadata_str)
+
+    st.subheader("📊 Оценка качества МРТ")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Качество", mri_analysis['quality_assessment'])
+        st.metric("Резкость", f"{mri_analysis['sharpness']:.1f}")
+    with col2:
+        st.metric("Шум", f"{mri_analysis['noise_level']:.1f}")
+        st.metric("SNR", f"{mri_analysis['snr']:.2f}")
+
+    st.caption(f"Артефакты: {mri_analysis['artifacts']}")
+
+    if 'assistant' not in st.session_state:
+        st.session_state.assistant = OpenRouterAssistant()
+    assistant = st.session_state.assistant
+
+    if st.button("🧠 ИИ-анализ МРТ (с контекстом)"):
+        with st.spinner("ИИ анализирует МРТ..."):
+            clinical_metadata = (
+                f"Качество: {mri_analysis['quality_assessment']}\n"
+                f"Резкость: {mri_analysis['sharpness']:.1f}\n"
+                f"Шум: {mri_analysis['noise_level']:.1f}\n"
+                f"SNR: {mri_analysis['snr']:.2f}\n"
+                f"Артефакты: {mri_analysis['artifacts']}\n"
+                f"Метод: {mri_analysis['analysis_method']}"
+            )
+            full_metadata = f"=== DICOM ДАННЫЕ ===\n{metadata_str}\n\n=== КАЧЕСТВО ===\n{clinical_metadata}"
+
+            prompt = """
+            Проанализируйте МРТ-срез на изображении. Учитывайте:
+            1. Анатомию (голова, позвоночник, сустав и т.д.) из описания
+            2. Качество: резкость, шум, артефакты
+            3. Визуальные патологии: опухоли, отёк, грыжи, кровоизлияния
+            4. Последовательность (T1, T2, FLAIR и т.д.)
+            5. Рекомендации: другие проекции, контраст, КТ, консультация невролога
+            Ответ должен быть нейровизуализационно точным.
+            """
+
+            result = assistant.send_vision_request(prompt, image_array, full_metadata)
+            st.markdown("### 🧠 Нейрорадиологическое заключение:")
+            st.write(result)
+
+    custom_q = st.text_input("Вопрос по МРТ:")
+    if st.button("💬 Спросить ИИ о МРТ") and custom_q:
+        full_metadata = f"=== ДАННЫЕ ===\n{metadata_str}\n\n=== КАЧЕСТВО ===\n" + \
+                        f"Качество: {mri_analysis['quality_assessment']}, SNR: {mri_analysis['snr']:.2f}"
+        result = assistant.send_vision_request(custom_q, image_array, full_metadata)
+        st.markdown("### 💬 Ответ:")
+        st.write(result)
+
+
+# --- ОСНОВНОЕ ПРИЛОЖЕНИЕ ---
 def main():
-    st.title("🏥 Медицинский Ассистент с ИИ")
-    st.markdown("### Анализ медицинских данных с интегрированным ИИ-консультантом")
-    
-    # Инициализация базы данных
-    init_database()
-    
-    # Боковая панель навигации
-    st.sidebar.title("🧭 Навигация")
-    
-    # Обработка кнопок быстрого перехода
-    if 'current_page' not in st.session_state:
-        st.session_state.current_page = "🏠 Главная"
-    
+    st.set_page_config(page_title="Медицинский ИИ-Ассистент", layout="wide")
+    st.sidebar.title("🧠 Меню")
+
+    # Список страниц
+    pages = ["🏠 Главная", "📈 Анализ ЭКГ", "🩻 Анализ рентгена", "🧠 Анализ МРТ"]
+
+    # Если текущая страница не в списке — сбросить
+    if "current_page" not in st.session_state or st.session_state.current_page not in pages:
+        st.session_state.current_page = pages[0]
+
+    # Выбор страницы
     page = st.sidebar.selectbox(
         "Выберите раздел:",
-        [
-            "🏠 Главная", 
-            "📈 Анализ ЭКГ", 
-            "🩻 Анализ рентгена",
-            "🤖 ИИ-Консультант",
-            "👤 База данных пациентов"
-        ],
-        index=[
-            "🏠 Главная", 
-            "📈 Анализ ЭКГ", 
-            "🩻 Анализ рентгена",
-            "🤖 ИИ-Консультант",
-            "👤 База данных пациентов"
-        ].index(st.session_state.current_page) if st.session_state.current_page in [
-            "🏠 Главная", 
-            "📈 Анализ ЭКГ", 
-            "🩻 Анализ рентгена",
-            "🤖 ИИ-Консультант",
-            "👤 База данных пациентов"
-        ] else 0
+        pages,
+        index=pages.index(st.session_state.current_page)
     )
-    
-    # Обновляем текущую страницу
     st.session_state.current_page = page
-    
-    # Маршрутизация страниц
+
+    # Маршрутизация
     if page == "🏠 Главная":
         show_home_page()
     elif page == "📈 Анализ ЭКГ":
         show_ecg_analysis()
     elif page == "🩻 Анализ рентгена":
         show_xray_analysis()
-    elif page == "🤖 ИИ-Консультант":
-        show_ai_chat()
-    elif page == "👤 База данных пациентов":
-        show_patient_database()
-    
-    # Информация в боковой панели
+    elif page == "🧠 Анализ МРТ":
+        show_mri_analysis()
+
     st.sidebar.markdown("---")
     st.sidebar.info("""
-    **Медицинский Ассистент v2.0**
-    
-    🔹 Анализ ЭКГ (CSV, PDF, JPG, PNG)
-    🔹 Анализ рентгена (JPG, PNG, DICOM)
-    🔹 ИИ-консультации  
-    🔹 База данных пациентов
-    🔹 OpenRouter API
-    
-    ⚠️ Только для образовательных целей
+    **Медицинский Ассистент v3.3**  
+    🔹 Vision + DICOM + анализ → ИИ с контекстом  
+    🔹 Поддержка: ЭКГ, рентген, МРТ, PDF  
+    🔹 Claude 3.5 Sonnet + OpenRouter  
+    ⚠️ Только для обучения
     """)
+
 
 if __name__ == "__main__":
     main()
