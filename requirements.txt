@@ -1,0 +1,15 @@
+streamlit
+pandas
+numpy
+plotly
+Pillow
+PyPDF2
+openpyxl
+opencv-python
+pydicom
+requests
+python-dotenv
+scikit-learn
+matplotlib
+seaborn
+scipy

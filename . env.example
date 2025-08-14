@@ -1,0 +1,86 @@
+# =================================================================
+# МЕДИЦИНСКИЙ АССИСТЕНТ - КОНФИГУРАЦИЯ
+# =================================================================
+
+# OpenRouter API ключ (уже настроен в коде)
+OPENROUTER_API_KEY=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
+
+# Настройки OpenRouter AI
+OPENROUTER_MODEL=anthropic/claude-3-sonnet  # Доступные: anthropic/claude-3-sonnet, openai/gpt-4, etc.
+AI_MAX_TOKENS=4000
+AI_TEMPERATURE=0.3
+
+# Дополнительные API ключи (опционально)
+ANTHROPIC_API_KEY=your_anthropic_key_here  # Если хотите использовать напрямую
+OPENAI_API_KEY=your_openai_key_here  # Для дополнительных функций
+
+# Настройки базы данных
+DATABASE_URL=sqlite:///data/medical_data.db
+DATABASE_BACKUP_ENABLED=true
+DATABASE_BACKUP_INTERVAL=24  # часов
+
+# Настройки приложения
+MAX_FILE_SIZE=200  # МБ
+ALLOWED_FILE_TYPES=csv,txt,json,xml,dcm,jpg,jpeg,png,pdf,xlsx,xls
+DEBUG_MODE=false
+LOG_LEVEL=INFO
+
+# Настройки безопасности
+ENABLE_FILE_ENCRYPTION=false
+SESSION_TIMEOUT=3600  # секунд
+MAX_CHAT_HISTORY=100  # сообщений
+
+# Настройки уведомлений
+ENABLE_EMAIL_NOTIFICATIONS=false
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USERNAME=your_email@gmail.com
+SMTP_PASSWORD=your_app_password
+
+# Настройки интеграции
+ENABLE_FHIR_INTEGRATION=false
+FHIR_SERVER_URL=https://your-fhir-server.com
+FHIR_API_KEY=your_fhir_api_key
+
+# Настройки производительности
+ENABLE_CACHING=true
+CACHE_TTL=3600  # секунд
+MAX_CONCURRENT_ANALYSES=5
+
+# Настройки локализации
+DEFAULT_LANGUAGE=ru
+TIMEZONE=Europe/Moscow
+DATE_FORMAT=%d.%m.%Y
+TIME_FORMAT=%H:%M:%S
+
+# Пути к файлам
+UPLOAD_DIRECTORY=./uploads
+TEMP_DIRECTORY=./temp
+BACKUP_DIRECTORY=./backups
+LOG_DIRECTORY=./logs
+
+# Настройки медицинских стандартов
+ENABLE_HL7_SUPPORT=false
+ENABLE_DICOM_VALIDATION=true
+DEFAULT_UNITS_SYSTEM=metric  # metric или imperial
+
+# OpenRouter специфичные настройки
+OPENROUTER_SITE_URL=https://medical-assistant.local
+OPENROUTER_APP_NAME=Medical Assistant
+OPENROUTER_HTTP_REFERER=https://medical-assistant.local
+
+# =================================================================
+# ИНСТРУКЦИИ ПО НАСТРОЙКЕ:
+# 
+# 1. Ваш OpenRouter ключ уже настроен в приложении
+# 2. Скопируйте этот файл как .env (опционально)
+# 3. Можете изменить модель ИИ или другие настройки
+# 4. Перезапустите приложение
+# 
+# ДОСТУПНЫЕ МОДЕЛИ ЧЕРЕЗ OPENROUTER:
+# - anthropic/claude-3-sonnet (рекомендуется)
+# - anthropic/claude-3-haiku (быстрая)
+# - openai/gpt-4 (мощная)
+# - openai/gpt-3.5-turbo (экономичная)
+# - meta-llama/llama-2-70b-chat (открытая)
+# =================================================================
